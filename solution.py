@@ -161,9 +161,12 @@ class SWAInferenceHandler(object):
         self.num_swag_updates = 0  
 
         # Full SWAG
-        # TODO(2): create attributes for SWAG-full
-        #  Hint: check collections.deque
-        self.swag_full_samples = collections.deque(maxlen=self.num_bma_samples)
+        # Store deviations from mean for full SWAG
+        self.swag_deviation_matrix = collections.deque(maxlen=self.max_rank_deviation_matrix)
+        
+        # Store total number of parameters for constructing deviation matrix
+        total_params = sum(param.numel() for param in self.network.parameters())
+        self.num_parameters = total_params
 
         # Calibration, prediction, and other attributes
         # TODO(2): create additional attributes, e.g., for calibration
@@ -359,10 +362,23 @@ class SWAInferenceHandler(object):
             sampled_weight = mean_weights + std_weights * z_diag
 
             # Full SWAG part
-            if self.inference_mode == InferenceMode.SWAG_FULL:
-                # TODO(2): Sample parameter values for full SWAG
-                raise NotImplementedError("Sample parameter for full SWAG")
-                sampled_weight += ...
+            if self.inference_mode == InferenceMode.SWAG_FULL and len(self.swag_deviation_matrix) > 0:
+                # Convert deviations to tensor and get rank
+                D = torch.stack(list(self.swag_deviation_matrix))  # K x P
+                rank = D.size(0)
+                
+                # Sample from standard normal for low-rank update
+                z_lr = torch.randn(rank)
+                
+                # Get the shape for reshaping the flattened parameters
+                param_shape = param.size()
+                
+                # Calculate the contribution from the low-rank part
+                # Scale by 1/sqrt(2) for the low rank update (see SWAG paper)
+                low_rank_update = (D.t() @ z_lr).view(param_shape) / math.sqrt(2.0 * (rank - 1))
+                
+                # Add low-rank update to the diagonal part
+                sampled_weight += low_rank_update
 
             # Modify weight value in-place; directly changing self.network
             param.data = sampled_weight
