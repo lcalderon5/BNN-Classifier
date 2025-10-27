@@ -113,7 +113,7 @@ class SWAInferenceHandler(object):
         model_dir: pathlib.Path,
         # TODO(1): change inference_mode to InferenceMode.SWAG_DIAGONAL
         # TODO(2): change inference_mode to InferenceMode.SWAG_FULL
-        inference_mode: InferenceMode = InferenceMode.SWAG_DIAGONAL,
+        inference_mode: InferenceMode = InferenceMode.SWAG_FULL,
         # TODO(2): optionally add/tweak hyperparameters
         swag_training_epochs: int = 30,
         swag_lr: float = 0.045,
@@ -163,6 +163,7 @@ class SWAInferenceHandler(object):
         # Full SWAG
         # TODO(2): create attributes for SWAG-full
         #  Hint: check collections.deque
+        self.swag_full_samples = collections.deque(maxlen=self.num_bma_samples)
 
         # Calibration, prediction, and other attributes
         # TODO(2): create additional attributes, e.g., for calibration
@@ -190,7 +191,13 @@ class SWAInferenceHandler(object):
         # Full SWAG
         if self.inference_mode == InferenceMode.SWAG_FULL:
             # TODO(2): update full SWAG attributes for weight `name` using `copied_params` and `param`
-            raise NotImplementedError("Update full SWAG statistics")
+            deviation_list = []
+            for name, param in copied_params.items():
+                deviation = (param - self.swag_mean[name]).clone().detach().flatten()
+                deviation_list.append(deviation)
+
+            deviation_vector = torch.cat(deviation_list).cpu()
+            self.swag_deviation_matrix.append(deviation_vector)
 
     def fit_swag_model(self, loader: torch.utils.data.DataLoader) -> None:
         """
