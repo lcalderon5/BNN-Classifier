@@ -153,7 +153,7 @@ class SWAInferenceHandler(object):
         #  as a dictionary that maps from weight name to values.
         #  Hint: you never need to consider the full vector of weights,
         #  but can always act on per-layer weights (in the format that _create_weight_copy() returns)
-        self._create_weight_copy() # Running mean
+        self.swag_mean = self._create_weight_copy()  # running mean
         self.swag_sq_mean = self._create_weight_copy()  # running second moment
         self.num_models_tracked = 0  # number of models incorporated into SWAG statistics
 
