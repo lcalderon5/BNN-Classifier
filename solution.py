@@ -31,13 +31,13 @@ Note that MAP inference can take a long time.
 
 
 def main():
-    raise RuntimeError(
-        "This main() method is for illustrative purposes only"
-        " and will NEVER be called when running your solution to generate your submission file!\n"
-        "The checker always directly interacts with your SWAInferenceHandler class and run_evaluation method.\n"
-        "You can remove this exception for local testing, but be aware that any changes to the main() method"
-        " are ignored when generating your submission file."
-    )
+    # raise RuntimeError(
+    #     "This main() method is for illustrative purposes only"
+    #     " and will NEVER be called when running your solution to generate your submission file!\n"
+    #     "The checker always directly interacts with your SWAInferenceHandler class and run_evaluation method.\n"
+    #     "You can remove this exception for local testing, but be aware that any changes to the main() method"
+    #     " are ignored when generating your submission file."
+    # )
 
     data_location = pathlib.Path.cwd()
     model_location = pathlib.Path.cwd()
@@ -291,11 +291,26 @@ class SWAInferenceHandler(object):
         model_predictions = []
         for _ in tqdm.trange(self.num_bma_samples, desc="Performing Bayesian model averaging"):
             # TODO(1): Sample new parameters for self.network from the SWAG approximate posterior
-            raise NotImplementedError("Sample network parameters")
+            for name, param in self.network.named_parameters():
+                mean = self.swag_mean[name]
+                var = self.swag_sq_mean[name] - mean ** 2
+                std = torch.sqrt(var.clamp(min=1e-30))  # numerical stability
+
+                eps = torch.randn_like(std)
+                sampled_param = mean + std * eps
+                param.data.copy_(sampled_param)
 
             # TODO(1): Perform inference for all samples in `loader` using current model sample,
             #  and add the predictions to model_predictions
-            raise NotImplementedError("Perform inference using current model")
+            preds = []
+            for x_batch, *_ in loader:
+                with torch.no_grad():
+                    logits = self.network(x_batch)
+                    probs = torch.softmax(logits, dim=-1)
+                preds.append(probs)
+
+            preds = torch.cat(preds, dim=0)  # shape: [N, 6]
+            model_predictions.append(preds)
 
         assert len(model_predictions) == self.num_bma_samples
         assert all(
@@ -306,8 +321,7 @@ class SWAInferenceHandler(object):
         )
 
         # TODO(1): Average predictions from different model samples into bma_probabilities
-        raise NotImplementedError("Aggregate predictions from model samples")
-        bma_probabilities = ...
+        bma_probabilities = torch.mean(torch.stack(model_predictions), dim=0)
 
         assert bma_probabilities.dim() == 2 and bma_probabilities.size(1) == 6  # N x C
         return bma_probabilities
@@ -324,9 +338,8 @@ class SWAInferenceHandler(object):
             # SWAG-diagonal part
             z_diag = torch.randn(param.size())
             # TODO(1): Sample parameter values for SWAG-diagonal
-            raise NotImplementedError("Sample parameter for SWAG-diagonal")
-            mean_weights = ...
-            std_weights = ...
+            mean_weights = self.swag_mean[name]
+            std_weights = torch.sqrt(self.swag_sq_mean[name] - mean_weights ** 2).clamp(min=1e-30)
             assert mean_weights.size() == param.size() and std_weights.size() == param.size()
 
             # Diagonal part
@@ -343,7 +356,7 @@ class SWAInferenceHandler(object):
 
         # TODO(1): Don't forget to update batch normalization statistics using self._update_batchnorm_statistics()
         #  in the appropriate place!
-        raise NotImplementedError("Update batch normalization statistics for newly sampled network")
+        self._update_batchnorm_statistics()
 
     def label_prediction(self, predicted_probabilities: torch.Tensor) -> torch.Tensor:
         """
