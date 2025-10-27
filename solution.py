@@ -292,12 +292,31 @@ class SWAInferenceHandler(object):
             self._calibration_threshold = 0.0
             return
 
-        # TODO(1): pick a prediction threshold, either constant or adaptive.
-        self._calibration_threshold = 2.0 / 3.0
+        no_calib = True
+        if no_calib:
+            self._calibration_threshold = 2.0 / 3.0
+            return
 
         # TODO(2): perform additional calibration if desired.
         #  Feel free to remove or change the prediction threshold.
         val_images, val_snow_labels, val_cloud_labels, val_labels = validation_data.tensors
+        val_probs = self.predict_probs(val_images)
+        max_probs, pred_labels = torch.max(val_probs, dim=-1)
+        
+        # Search over reasonable threshold range
+        thresholds = torch.linspace(0.6, 0.85, 20)
+        best_cost = float('inf')
+        best_threshold = 0.667
+        
+        for threshold in thresholds:
+            preds = torch.where(max_probs >= threshold, pred_labels, -torch.ones_like(pred_labels))
+            cost = compute_cost(preds, val_labels).item()
+            if cost < best_cost:
+                best_cost = cost
+                best_threshold = threshold.item()
+        
+        self._calibration_threshold = best_threshold
+
         assert val_images.size() == (140, 3, 60, 60)  # N x C x H x W
         assert val_labels.size() == (140,)
         assert val_snow_labels.size() == (140,)
