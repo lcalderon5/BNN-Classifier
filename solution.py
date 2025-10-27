@@ -113,7 +113,7 @@ class SWAInferenceHandler(object):
         model_dir: pathlib.Path,
         # TODO(1): change inference_mode to InferenceMode.SWAG_DIAGONAL
         # TODO(2): change inference_mode to InferenceMode.SWAG_FULL
-        inference_mode: InferenceMode = InferenceMode.MAP,
+        inference_mode: InferenceMode = InferenceMode.SWAG_DIAGONAL,
         # TODO(2): optionally add/tweak hyperparameters
         swag_training_epochs: int = 30,
         swag_lr: float = 0.045,
@@ -153,6 +153,9 @@ class SWAInferenceHandler(object):
         #  as a dictionary that maps from weight name to values.
         #  Hint: you never need to consider the full vector of weights,
         #  but can always act on per-layer weights (in the format that _create_weight_copy() returns)
+        self._create_weight_copy() # Running mean
+        self.swag_sq_mean = self._create_weight_copy()  # running second moment
+        self.num_models_tracked = 0  # number of models incorporated into SWAG statistics
 
         # Full SWAG
         # TODO(2): create attributes for SWAG-full
@@ -173,7 +176,13 @@ class SWAInferenceHandler(object):
         # SWAG-diagonal
         for name, param in copied_params.items():
             # TODO(1): update SWAG-diagonal attributes for weight `name` using `copied_params` and `param`
-            raise NotImplementedError("Update SWAG-diagonal statistics")
+            mean_old = self.swag_mean[name]
+            sq_mean_old = self.swag_sq_mean[name]
+
+            self.swag_mean[name] = mean_old + (param - mean_old) / (self.num_models_tracked + 1)
+            self.swag_sq_mean[name] = sq_mean_old + (param ** 2 - sq_mean_old) / (self.num_models_tracked + 1)
+
+        self.num_models_tracked += 1
 
         # Full SWAG
         if self.inference_mode == InferenceMode.SWAG_FULL:
@@ -209,8 +218,6 @@ class SWAInferenceHandler(object):
         )
 
         # TODO(1): Perform initialization for SWAG fitting
-        raise NotImplementedError("Initialize SWAG fitting")
-
         self.network.train()
         with tqdm.trange(self.swag_training_epochs, desc="Running gradient descent for SWA") as pbar:
             progress_dict = {}
@@ -241,7 +248,8 @@ class SWAInferenceHandler(object):
                     pbar.set_postfix(progress_dict)
 
                 # TODO(1): Implement periodic SWAG updates using the attributes defined in __init__
-                raise NotImplementedError("Periodically update SWAG statistics")
+                if (epoch + 1) % self.swag_update_interval == 0:
+                    self.update_swag_statistics()
 
     def run_calibration(self, validation_data: torch.utils.data.Dataset) -> None:
         """
