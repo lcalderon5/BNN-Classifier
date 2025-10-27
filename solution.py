@@ -144,6 +144,15 @@ class SWAInferenceHandler(object):
         # Note that all operations in this class modify this network IN-PLACE!
         self.network = CNN(in_channels=3, out_classes=6)
 
+        # Keep track of parameter ordering for flattening/slicing operations
+        self._parameter_slices: typing.Dict[str, typing.Tuple[int, int]] = {}
+        offset = 0
+        for name, param in self.network.named_parameters():
+            numel = param.numel()
+            self._parameter_slices[name] = (offset, offset + numel)
+            offset += numel
+        self._total_parameter_count = offset
+
         # Store training dataset to recalculate batch normalization statistics during SWAG inference
         self.training_dataset = torch.utils.data.TensorDataset(train_xs)
 
@@ -163,10 +172,6 @@ class SWAInferenceHandler(object):
         # Full SWAG
         # Store deviations from mean for full SWAG
         self.swag_deviation_matrix = collections.deque(maxlen=self.max_rank_deviation_matrix)
-        
-        # Store total number of parameters for constructing deviation matrix
-        total_params = sum(param.numel() for param in self.network.parameters())
-        self.num_parameters = total_params
 
         # Calibration, prediction, and other attributes
         # TODO(2): create additional attributes, e.g., for calibration
@@ -179,6 +184,7 @@ class SWAInferenceHandler(object):
 
         # Create a copy of the current network weights
         copied_params = {name: param.detach() for name, param in self.network.named_parameters()}
+        param_device = next(self.network.parameters()).device
 
         # SWAG-diagonal
         for name, param in copied_params.items():
@@ -199,7 +205,7 @@ class SWAInferenceHandler(object):
                 deviation = (param - self.swag_mean[name]).clone().detach().flatten()
                 deviation_list.append(deviation)
 
-            deviation_vector = torch.cat(deviation_list).cpu()
+            deviation_vector = torch.cat(deviation_list).to(param_device)
             self.swag_deviation_matrix.append(deviation_vector)
 
     def fit_swag_model(self, loader: torch.utils.data.DataLoader) -> None:
@@ -235,22 +241,23 @@ class SWAInferenceHandler(object):
         self.swag_mean = self._create_weight_copy()
         self.swag_sq_mean = self._create_weight_copy()
         self.num_swag_updates = 0
+        self.swag_deviation_matrix.clear()
 
         self.network.train()
-        with tqdm.trange(self.swag_training_epochs, desc="Running gradient descent for SWA") as pbar:
-            progress_dict = {}
+        with tqdm.trange(self.swag_training_epochs, desc="Running GD for SWA") as pbar:
             for epoch in pbar:
                 avg_loss = 0.0
                 avg_accuracy = 0.0
                 num_samples = 0
+                current_lr = lr_scheduler.get_last_lr()[0]
                 for batch_images, batch_snow_labels, batch_cloud_labels, batch_labels in loader:
                     optimizer.zero_grad()
                     predictions = self.network(batch_images)
                     batch_loss = loss_fn(input=predictions, target=batch_labels)
                     batch_loss.backward()
                     optimizer.step()
-                    progress_dict["lr"] = lr_scheduler.get_last_lr()[0]
                     lr_scheduler.step()
+                    current_lr = lr_scheduler.get_last_lr()[0]
 
                     # Calculate cumulative average training loss and accuracy
                     avg_loss = (batch_images.size(0) * batch_loss.item() + num_samples * avg_loss) / (
@@ -261,9 +268,13 @@ class SWAInferenceHandler(object):
                         + num_samples * avg_accuracy
                     ) / (num_samples + batch_images.size(0))
                     num_samples += batch_images.size(0)
-                    progress_dict["avg. epoch loss"] = avg_loss
-                    progress_dict["avg. epoch accuracy"] = avg_accuracy
-                    pbar.set_postfix(progress_dict)
+
+                postfix = {
+                    "lr": f"{current_lr:.4f}",
+                    "loss": f"{avg_loss:.3f}",
+                    "acc": f"{avg_accuracy:.3f}",
+                }
+                pbar.set_postfix(postfix)
 
                 # TODO(1): Implement periodic SWAG updates using the attributes defined in __init__
                 # Update SWAG statistics every swag_update_interval epochs
@@ -344,44 +355,34 @@ class SWAInferenceHandler(object):
         Hence, after calling this method, self.network corresponds to a new posterior sample.
         """
 
-        # Instead of acting on a full vector of parameters, all operations can be done on per-layer parameters.
-        for name, param in self.network.named_parameters():
-            # SWAG-diagonal part
-            z_diag = torch.randn(param.size())
-            # TODO(1): Sample parameter values for SWAG-diagonal
-            # Get mean and compute standard deviation from the stored statistics
-            mean_weights = self.swag_mean[name]
-            # Variance = E[θ²] - E[θ]²
-            variance = self.swag_sq_mean[name] - self.swag_mean[name] ** 2
-            # Clamp variance to be non-negative (for numerical stability)
-            variance = torch.clamp(variance, min=0.0)
-            std_weights = torch.sqrt(variance)
-            assert mean_weights.size() == param.size() and std_weights.size() == param.size()
+        device = next(self.network.parameters()).device
 
-            # Diagonal part
-            sampled_weight = mean_weights + std_weights * z_diag
-
-            # Full SWAG part
-            if self.inference_mode == InferenceMode.SWAG_FULL and len(self.swag_deviation_matrix) > 0:
-                # Convert deviations to tensor and get rank
-                D = torch.stack(list(self.swag_deviation_matrix))  # K x P
+        low_rank_vector: typing.Optional[torch.Tensor] = None
+        if self.inference_mode == InferenceMode.SWAG_FULL:
+            if len(self.swag_deviation_matrix) >= 2:
+                D = torch.stack(list(self.swag_deviation_matrix)).to(device)  # K x P
                 rank = D.size(0)
-                
-                # Sample from standard normal for low-rank update
-                z_lr = torch.randn(rank)
-                
-                # Get the shape for reshaping the flattened parameters
-                param_shape = param.size()
-                
-                # Calculate the contribution from the low-rank part
-                # Scale by 1/sqrt(2) for the low rank update (see SWAG paper)
-                low_rank_update = (D.t() @ z_lr).view(param_shape) / math.sqrt(2.0 * (rank - 1))
-                
-                # Add low-rank update to the diagonal part
-                sampled_weight += low_rank_update
+                z_lr = torch.randn(rank, device=device)
+                low_rank_vector = torch.matmul(D.t(), z_lr) / math.sqrt(rank - 1)
+            else:
+                low_rank_vector = None
 
-            # Modify weight value in-place; directly changing self.network
-            param.data = sampled_weight
+        diag_scale = 1.0 / math.sqrt(2.0)
+
+        for name, param in self.network.named_parameters():
+            mean_weights = self.swag_mean[name]
+            variance = (self.swag_sq_mean[name] - mean_weights ** 2).clamp(min=1e-30)
+            std_weights = torch.sqrt(variance)
+
+            z_diag = torch.randn_like(mean_weights)
+            sampled_weight = mean_weights + diag_scale * std_weights * z_diag
+
+            if low_rank_vector is not None:
+                start, end = self._parameter_slices[name]
+                update = low_rank_vector[start:end].to(mean_weights.dtype).view(mean_weights.size()) * diag_scale
+                sampled_weight = sampled_weight + update
+
+            param.data.copy_(sampled_weight)
 
         # TODO(1): Don't forget to update batch normalization statistics using self._update_batchnorm_statistics()
         #  in the appropriate place!
