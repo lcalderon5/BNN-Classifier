@@ -153,9 +153,12 @@ class SWAInferenceHandler(object):
         #  as a dictionary that maps from weight name to values.
         #  Hint: you never need to consider the full vector of weights,
         #  but can always act on per-layer weights (in the format that _create_weight_copy() returns)
-        self.swag_mean = self._create_weight_copy()  # running mean
-        self.swag_sq_mean = self._create_weight_copy()  # running second moment
-        self.num_models_tracked = 0  # number of models incorporated into SWAG statistics
+        # Running mean of weights
+        self.swag_mean = self._create_weight_copy()  
+        # Running mean of squared weights
+        self.swag_sq_mean = self._create_weight_copy()  
+        # Counter for number of SWAG updates
+        self.num_swag_updates = 0  
 
         # Full SWAG
         # TODO(2): create attributes for SWAG-full
@@ -176,13 +179,13 @@ class SWAInferenceHandler(object):
         # SWAG-diagonal
         for name, param in copied_params.items():
             # TODO(1): update SWAG-diagonal attributes for weight `name` using `copied_params` and `param`
-            mean_old = self.swag_mean[name]
-            sq_mean_old = self.swag_sq_mean[name]
+            # Update running mean: mean_new = (n * mean_old + param) / (n + 1)
+            self.swag_mean[name] = (self.num_swag_updates * self.swag_mean[name] + param) / (self.num_swag_updates + 1)
+            # Update running mean of squared weights
+            self.swag_sq_mean[name] = (self.num_swag_updates * self.swag_sq_mean[name] + param ** 2) / (self.num_swag_updates + 1)
 
-            self.swag_mean[name] = mean_old + (param - mean_old) / (self.num_models_tracked + 1)
-            self.swag_sq_mean[name] = sq_mean_old + (param ** 2 - sq_mean_old) / (self.num_models_tracked + 1)
-
-        self.num_models_tracked += 1
+        # Increment the counter after updating all parameters
+        self.num_swag_updates += 1
 
         # Full SWAG
         if self.inference_mode == InferenceMode.SWAG_FULL:
@@ -218,6 +221,11 @@ class SWAInferenceHandler(object):
         )
 
         # TODO(1): Perform initialization for SWAG fitting
+        # Reset SWAG statistics before starting training
+        self.swag_mean = self._create_weight_copy()
+        self.swag_sq_mean = self._create_weight_copy()
+        self.num_swag_updates = 0
+
         self.network.train()
         with tqdm.trange(self.swag_training_epochs, desc="Running gradient descent for SWA") as pbar:
             progress_dict = {}
@@ -248,6 +256,7 @@ class SWAInferenceHandler(object):
                     pbar.set_postfix(progress_dict)
 
                 # TODO(1): Implement periodic SWAG updates using the attributes defined in __init__
+                # Update SWAG statistics every swag_update_interval epochs
                 if (epoch + 1) % self.swag_update_interval == 0:
                     self.update_swag_statistics()
 
@@ -291,26 +300,17 @@ class SWAInferenceHandler(object):
         model_predictions = []
         for _ in tqdm.trange(self.num_bma_samples, desc="Performing Bayesian model averaging"):
             # TODO(1): Sample new parameters for self.network from the SWAG approximate posterior
-            for name, param in self.network.named_parameters():
-                mean = self.swag_mean[name]
-                var = self.swag_sq_mean[name] - mean ** 2
-                std = torch.sqrt(var.clamp(min=1e-30))  # numerical stability
-
-                eps = torch.randn_like(std)
-                sampled_param = mean + std * eps
-                param.data.copy_(sampled_param)
+            self.sample_parameters()
 
             # TODO(1): Perform inference for all samples in `loader` using current model sample,
             #  and add the predictions to model_predictions
-            preds = []
-            for x_batch, *_ in loader:
-                with torch.no_grad():
-                    logits = self.network(x_batch)
-                    probs = torch.softmax(logits, dim=-1)
-                preds.append(probs)
-
-            preds = torch.cat(preds, dim=0)  # shape: [N, 6]
-            model_predictions.append(preds)
+            # Collect predictions for all batches
+            batch_predictions = []
+            for (batch_images,) in loader:
+                batch_predictions.append(self.network(batch_images))
+            # Concatenate all batch predictions and apply softmax
+            all_predictions = torch.cat(batch_predictions)
+            model_predictions.append(torch.softmax(all_predictions, dim=-1))
 
         assert len(model_predictions) == self.num_bma_samples
         assert all(
@@ -321,6 +321,7 @@ class SWAInferenceHandler(object):
         )
 
         # TODO(1): Average predictions from different model samples into bma_probabilities
+        # Stack all predictions and take the mean across samples
         bma_probabilities = torch.mean(torch.stack(model_predictions), dim=0)
 
         assert bma_probabilities.dim() == 2 and bma_probabilities.size(1) == 6  # N x C
@@ -338,8 +339,13 @@ class SWAInferenceHandler(object):
             # SWAG-diagonal part
             z_diag = torch.randn(param.size())
             # TODO(1): Sample parameter values for SWAG-diagonal
+            # Get mean and compute standard deviation from the stored statistics
             mean_weights = self.swag_mean[name]
-            std_weights = torch.sqrt(self.swag_sq_mean[name] - mean_weights ** 2).clamp(min=1e-30)
+            # Variance = E[θ²] - E[θ]²
+            variance = self.swag_sq_mean[name] - self.swag_mean[name] ** 2
+            # Clamp variance to be non-negative (for numerical stability)
+            variance = torch.clamp(variance, min=0.0)
+            std_weights = torch.sqrt(variance)
             assert mean_weights.size() == param.size() and std_weights.size() == param.size()
 
             # Diagonal part
@@ -356,6 +362,7 @@ class SWAInferenceHandler(object):
 
         # TODO(1): Don't forget to update batch normalization statistics using self._update_batchnorm_statistics()
         #  in the appropriate place!
+        # Update batch normalization statistics for the newly sampled network
         self._update_batchnorm_statistics()
 
     def label_prediction(self, predicted_probabilities: torch.Tensor) -> torch.Tensor:
