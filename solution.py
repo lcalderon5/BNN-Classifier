@@ -587,8 +587,7 @@ class SWAInferenceHandler(object):
 
         max_probs, max_labels = torch.max(predicted_probabilities, dim=-1)
 
-        low_confidence = max_probs < self._confidence_threshold
-        should_abstain = low_confidence
+        should_abstain = max_probs < self._confidence_threshold
         
         return torch.where(should_abstain, -torch.ones_like(max_labels), max_labels)
 
