@@ -31,6 +31,7 @@ Note that MAP inference can take a long time.
 
 
 def main():
+
     # raise RuntimeError(
     #     "This main() method is for illustrative purposes only"
     #     " and will NEVER be called when running your solution to generate your submission file!\n"
@@ -292,35 +293,231 @@ class SWAInferenceHandler(object):
             self._calibration_threshold = 0.0
             return
 
-        no_calib = True
-        if no_calib:
-            self._calibration_threshold = 2.0 / 3.0
-            return
+        Debug = False
+        if Debug:
+            self.debug_validation_predictions(validation_data)
+
+        self._calibration_threshold = 2.0/3.0
 
         # TODO(2): perform additional calibration if desired.
         #  Feel free to remove or change the prediction threshold.
         val_images, val_snow_labels, val_cloud_labels, val_labels = validation_data.tensors
         val_probs = self.predict_probs(val_images)
         max_probs, pred_labels = torch.max(val_probs, dim=-1)
-        
-        # Search over reasonable threshold range
-        thresholds = torch.linspace(0.6, 0.85, 20)
-        best_cost = float('inf')
-        best_threshold = 0.667
-        
-        for threshold in thresholds:
-            preds = torch.where(max_probs >= threshold, pred_labels, -torch.ones_like(pred_labels))
-            cost = compute_cost(preds, val_labels).item()
-            if cost < best_cost:
-                best_cost = cost
-                best_threshold = threshold.item()
-        
+
+        threshold_grid = False
+        entropy_calib = True
+        if threshold_grid:
+            thresholds = torch.linspace(0.6, 0.85, 20)
+            best_cost = float('inf')
+            best_threshold = 0.667
+            
+            for threshold in thresholds:
+                preds = torch.where(max_probs >= threshold, pred_labels, -torch.ones_like(pred_labels))
+                cost = compute_cost(preds, val_labels).item()
+                if cost < best_cost:
+                    best_cost = cost
+                    best_threshold = threshold.item()
+            
+        elif entropy_calib:
+            # Calculate normalized entropy
+            entropy = -torch.sum(val_probs * torch.log(val_probs + 1e-10), dim=-1)
+            normalized_entropy = entropy / math.log(6)  # max entropy for 6 classes
+
+            thresholds = torch.linspace(0.3, 0.7, 20)
+            best_cost = float('inf')
+            best_threshold = 0.5
+            
+            for threshold in thresholds:
+                # Abstain if entropy is high OR max prob is low
+                should_abstain = (normalized_entropy > threshold) | (max_probs < threshold)
+                preds = torch.where(should_abstain, -torch.ones_like(pred_labels), pred_labels)
+                cost = compute_cost(preds, val_labels).item()
+                
+                if cost < best_cost:
+                    best_cost = cost
+                    best_threshold = threshold.item()
+
         self._calibration_threshold = best_threshold
 
         assert val_images.size() == (140, 3, 60, 60)  # N x C x H x W
         assert val_labels.size() == (140,)
         assert val_snow_labels.size() == (140,)
         assert val_cloud_labels.size() == (140,)
+
+    def _visualize_predictions(
+        self, 
+        images: torch.Tensor, 
+        probabilities: torch.Tensor, 
+        labels: torch.Tensor,
+        num_samples: int = 20,
+        save_path: typing.Optional[pathlib.Path] = None
+    ) -> None:
+        """
+        Visualize model predictions on validation samples.
+        Shows images with their predicted probability distributions and true labels.
+        """
+        import matplotlib.pyplot as plt
+        
+        # Select samples to visualize
+        # Show a mix: some ambiguous, some non-ambiguous, some high/low confidence
+        max_probs, pred_labels = torch.max(probabilities, dim=-1)
+        
+        # Get indices of different sample types
+        ambiguous_indices = torch.where(labels == -1)[0]
+        non_ambiguous_indices = torch.where(labels != -1)[0]
+        
+        # Sort by confidence
+        sorted_indices = torch.argsort(max_probs)
+        low_conf_indices = sorted_indices[:10]
+        high_conf_indices = sorted_indices[-10:]
+        
+        # Create a diverse sample
+        sample_indices = []
+        if len(ambiguous_indices) >= 5:
+            sample_indices.extend(ambiguous_indices[:5].tolist())
+        if len(low_conf_indices) >= 5:
+            sample_indices.extend(low_conf_indices[:5].tolist())
+        if len(high_conf_indices) >= 5:
+            sample_indices.extend(high_conf_indices[:5].tolist())
+        if len(non_ambiguous_indices) >= 5:
+            sample_indices.extend(non_ambiguous_indices[:5].tolist())
+        
+        sample_indices = sample_indices[:num_samples]
+        
+        # Create figure
+        num_cols = 5
+        num_rows = (len(sample_indices) + num_cols - 1) // num_cols * 2  # 2 rows per sample
+        fig, axes = plt.subplots(num_rows, num_cols, figsize=(15, 3 * num_rows // 2))
+        
+        if num_rows == 1:
+            axes = axes.reshape(1, -1)
+        
+        class_names = ['0', '1', '2', '3', '4', '5']
+        
+        for idx, sample_idx in enumerate(sample_indices):
+            row = (idx // num_cols) * 2
+            col = idx % num_cols
+            
+            # Plot image
+            img = images[sample_idx].permute(1, 2, 0).numpy()
+            axes[row, col].imshow(img)
+            axes[row, col].set_axis_off()
+            
+            true_label = labels[sample_idx].item()
+            pred_label = pred_labels[sample_idx].item()
+            confidence = max_probs[sample_idx].item()
+            
+            title = f"True: {true_label}\nPred: {pred_label} ({confidence:.2f})"
+            axes[row, col].set_title(title, fontsize=8)
+            
+            # Plot probability distribution
+            probs = probabilities[sample_idx].numpy()
+            bar_colors = ['C0'] * 6
+            if true_label >= 0:
+                bar_colors[true_label] = 'C1'  # Highlight true label
+            if pred_label >= 0 and pred_label != true_label:
+                bar_colors[pred_label] = 'C2'  # Highlight predicted label
+            
+            axes[row + 1, col].bar(
+                range(6), 
+                probs, 
+                tick_label=class_names,
+                color=bar_colors
+            )
+            axes[row + 1, col].set_ylim([0, 1])
+            axes[row + 1, col].set_ylabel('Prob', fontsize=8)
+            axes[row + 1, col].tick_params(labelsize=8)
+        
+        # Hide unused subplots
+        for idx in range(len(sample_indices), num_rows * num_cols // 2):
+            row = (idx // num_cols) * 2
+            col = idx % num_cols
+            axes[row, col].set_visible(False)
+            axes[row + 1, col].set_visible(False)
+        
+        plt.tight_layout()
+        plt.show()
+        
+        if save_path:
+            plt.savefig(save_path / "calibration_predictions.pdf", bbox_inches='tight')
+            print(f"Saved visualization to {save_path / 'calibration_predictions.pdf'}")
+        else:
+            plt.savefig("calibration_predictions.pdf", bbox_inches='tight')
+            print("Saved visualization to calibration_predictions.pdf")
+        
+        plt.close()
+
+
+    def debug_validation_predictions(self, validation_data: torch.utils.data.Dataset, output_dir: pathlib.Path = pathlib.Path.cwd()) -> None:
+        """
+        Comprehensive debugging of validation predictions.
+        Call this after training to understand model behavior.
+        """
+        val_images, _, _, val_labels = validation_data.tensors
+        val_probs = self.predict_probs(val_images)
+        max_probs, pred_labels = torch.max(val_probs, dim=-1)
+        
+        print("\n" + "="*60)
+        print("VALIDATION SET ANALYSIS")
+        print("="*60)
+        
+        # 1. Dataset composition
+        num_ambiguous = (val_labels == -1).sum().item()
+        num_per_class = [(val_labels == i).sum().item() for i in range(6)]
+        print(f"\nDataset composition:")
+        print(f"  Ambiguous samples: {num_ambiguous}")
+        for i, count in enumerate(num_per_class):
+            print(f"  Class {i}: {count} samples")
+        
+        # 2. Confidence statistics
+        print(f"\nConfidence distribution:")
+        print(f"  Min: {max_probs.min():.4f}")
+        print(f"  25th percentile: {torch.quantile(max_probs, 0.25):.4f}")
+        print(f"  Median: {torch.median(max_probs):.4f}")
+        print(f"  75th percentile: {torch.quantile(max_probs, 0.75):.4f}")
+        print(f"  Max: {max_probs.max():.4f}")
+        print(f"  Mean: {max_probs.mean():.4f}")
+        
+        # 3. Accuracy by confidence bin
+        print(f"\nAccuracy by confidence bin:")
+        bins = [0.0, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
+        for i in range(len(bins) - 1):
+            mask = (max_probs >= bins[i]) & (max_probs < bins[i+1])
+            if mask.sum() > 0:
+                correct = (pred_labels[mask] == val_labels[mask]).sum().item()
+                total = mask.sum().item()
+                print(f"  [{bins[i]:.1f}, {bins[i+1]:.1f}): {correct}/{total} = {correct/total:.2%}")
+        
+        # 4. Confusion between prediction and confidence
+        print(f"\nPredictions on ambiguous samples:")
+        ambig_mask = val_labels == -1
+        if ambig_mask.sum() > 0:
+            ambig_probs = max_probs[ambig_mask]
+            print(f"  Number: {ambig_mask.sum().item()}")
+            print(f"  Mean confidence: {ambig_probs.mean():.4f}")
+            print(f"  Predicted labels distribution:")
+            for i in range(6):
+                count = (pred_labels[ambig_mask] == i).sum().item()
+                print(f"    Class {i}: {count}")
+        
+        # 5. Worst mistakes (high confidence, wrong prediction)
+        non_ambig_mask = val_labels != -1
+        wrong_mask = non_ambig_mask & (pred_labels != val_labels)
+        if wrong_mask.sum() > 0:
+            wrong_confidences = max_probs[wrong_mask]
+            sorted_wrong = torch.argsort(wrong_confidences, descending=True)
+            print(f"\nTop 5 high-confidence mistakes:")
+            for i in range(min(5, sorted_wrong.size(0))):
+                idx = torch.where(wrong_mask)[0][sorted_wrong[i]]
+                print(f"  Sample {idx.item()}: true={val_labels[idx].item()}, "
+                    f"pred={pred_labels[idx].item()}, conf={max_probs[idx].item():.4f}")
+        
+        # 6. Visualize
+        self._visualize_predictions(val_images, val_probs, val_labels, num_samples=20, save_path=output_dir)
+        
+        print("\n" + "="*60)
+
 
     def predict_probabilities_swag(self, loader: torch.utils.data.DataLoader) -> torch.Tensor:
         """
