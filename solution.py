@@ -15,7 +15,7 @@ from matplotlib import pyplot as plt
 
 from util import paint_reliability_diagram, compute_cost, seed_setup, calculate_calibration_curve
 
-ENABLE_EXTENDED_ANALYSIS = False
+ENABLE_EXTENDED_ANALYSIS = True
 """
 Set `ENABLE_EXTENDED_ANALYSIS` to `True` in order to generate additional plots on validation data.
 """
