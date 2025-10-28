@@ -176,7 +176,8 @@ class SWAInferenceHandler(object):
 
         # Calibration, prediction, and other attributes
         # TODO(2): create additional attributes, e.g., for calibration
-        self._calibration_threshold = None  # this is an example, feel free to be creative
+        self._confidence_threshold = 0.75  # Abstain if max_prob < this
+        self._entropy_threshold = 0.5     # Abstain if entropy > this
 
     def update_swag_statistics(self) -> None:
         """
@@ -297,48 +298,33 @@ class SWAInferenceHandler(object):
         if Debug:
             self.debug_validation_predictions(validation_data)
 
-        self._calibration_threshold = 2.0/3.0
 
         # TODO(2): perform additional calibration if desired.
         #  Feel free to remove or change the prediction threshold.
-        val_images, val_snow_labels, val_cloud_labels, val_labels = validation_data.tensors
-        val_probs = self.predict_probs(val_images)
-        max_probs, pred_labels = torch.max(val_probs, dim=-1)
-
-        threshold_grid = False
-        entropy_calib = True
-        if threshold_grid:
-            thresholds = torch.linspace(0.6, 0.85, 20)
-            best_cost = float('inf')
-            best_threshold = 0.667
+        thershold_calib = False
+        if thershold_calib:
+            val_images, val_snow_labels, val_cloud_labels, val_labels = validation_data.tensors
+            val_probs = self.predict_probs(val_images)
+            max_probs, pred_labels = torch.max(val_probs, dim=-1)
             
-            for threshold in thresholds:
-                preds = torch.where(max_probs >= threshold, pred_labels, -torch.ones_like(pred_labels))
-                cost = compute_cost(preds, val_labels).item()
-                if cost < best_cost:
-                    best_cost = cost
-                    best_threshold = threshold.item()
-            
-        elif entropy_calib:
             # Calculate normalized entropy
             entropy = -torch.sum(val_probs * torch.log(val_probs + 1e-10), dim=-1)
-            normalized_entropy = entropy / math.log(6)  # max entropy for 6 classes
-
-            thresholds = torch.linspace(0.3, 0.7, 20)
-            best_cost = float('inf')
-            best_threshold = 0.5
+            normalized_entropy = entropy / math.log(6)
             
-            for threshold in thresholds:
-                # Abstain if entropy is high OR max prob is low
-                should_abstain = (normalized_entropy > threshold) | (max_probs < threshold)
-                preds = torch.where(should_abstain, -torch.ones_like(pred_labels), pred_labels)
-                cost = compute_cost(preds, val_labels).item()
-                
-                if cost < best_cost:
-                    best_cost = cost
-                    best_threshold = threshold.item()
-
-        self._calibration_threshold = best_threshold
+            # Use median entropy of ambiguous samples as threshold
+            ambig_mask = val_labels == -1
+            if ambig_mask.sum() >= 5:  # Need enough samples
+                self._entropy_threshold = normalized_entropy[ambig_mask].median().item()
+                print(f"Entropy threshold (median of ambiguous): {self._entropy_threshold:.3f}")
+            else:
+                self._entropy_threshold = 0.5  # Fallback
+                print(f"Entropy threshold (default): {self._entropy_threshold:.3f}")
+            
+            # Report validation cost
+            _, pred_labels = torch.max(val_probs, dim=-1)
+            preds = torch.where(normalized_entropy > self._entropy_threshold, -torch.ones_like(pred_labels), pred_labels)
+            cost = compute_cost(preds, val_labels).item()
+            print(f"Validation cost: {cost:.4f}")
 
         assert val_images.size() == (140, 3, 60, 60)  # N x C x H x W
         assert val_labels.size() == (140,)
@@ -616,20 +602,24 @@ class SWAInferenceHandler(object):
 
         # label_probabilities contains the per-row maximum values in predicted_probabilities,
         # max_likelihood_labels the corresponding column index (equivalent to class).
-        label_probabilities, max_likelihood_labels = torch.max(predicted_probabilities, dim=-1)
-        num_samples, num_classes = predicted_probabilities.size()
-        assert label_probabilities.size() == (num_samples,) and max_likelihood_labels.size() == (num_samples,)
+        # label_probabilities, max_likelihood_labels = torch.max(predicted_probabilities, dim=-1)
+        # num_samples, num_classes = predicted_probabilities.size()
+        # assert label_probabilities.size() == (num_samples,) and max_likelihood_labels.size() == (num_samples,)
 
-        # A model without uncertainty awareness might simply predict the most likely label per sample:
-        # return max_likelihood_labels
-
-        # A bit better: use a threshold to decide whether to return a label or "don't know" (label -1)
-        # TODO(2): implement a different decision rule if desired
-        return torch.where(
-            label_probabilities >= self._calibration_threshold,
-            max_likelihood_labels,
-            torch.ones_like(max_likelihood_labels) * -1,
-        )
+        max_probs, max_labels = torch.max(predicted_probabilities, dim=-1)
+    
+        # Calculate normalized entropy
+        entropy = -torch.sum(predicted_probabilities * torch.log(predicted_probabilities + 1e-10), dim=-1)
+        normalized_entropy = entropy / math.log(6)
+        
+        # Abstain if EITHER:
+        # - Confidence is too low (max_prob < threshold), OR
+        # - Entropy is too high (distribution is too uniform)
+        low_confidence = max_probs < self._confidence_threshold
+        high_entropy = normalized_entropy > self._entropy_threshold
+        should_abstain = low_confidence | high_entropy
+        
+        return torch.where(should_abstain, -torch.ones_like(max_labels), max_labels)
 
     def _create_weight_copy(self) -> typing.Dict[str, torch.Tensor]:
         """Create an all-zero copy of the network weights as a dictionary that maps name -> weight"""
