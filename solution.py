@@ -177,7 +177,7 @@ class SWAInferenceHandler(object):
         # Calibration, prediction, and other attributes
         # TODO(2): create additional attributes, e.g., for calibration
         self._confidence_threshold = 0.75  # Abstain if max_prob < this
-        self._entropy_threshold = 0.5     # Abstain if entropy > this
+        self._entropy_threshold = 0.65     # Abstain if entropy > this
 
     def update_swag_statistics(self) -> None:
         """
@@ -299,32 +299,110 @@ class SWAInferenceHandler(object):
             self.debug_validation_predictions(validation_data)
 
 
+        val_images, val_snow_labels, val_cloud_labels, val_labels = validation_data.tensors
+        val_probs = self.predict_probs(val_images)
+        max_probs, pred_labels = torch.max(val_probs, dim=-1)
+
         # TODO(2): perform additional calibration if desired.
         #  Feel free to remove or change the prediction threshold.
-        thershold_calib = False
-        if thershold_calib:
-            val_images, val_snow_labels, val_cloud_labels, val_labels = validation_data.tensors
-            val_probs = self.predict_probs(val_images)
-            max_probs, pred_labels = torch.max(val_probs, dim=-1)
-            
+        threshold_calib = False
+        if threshold_calib:
+
             # Calculate normalized entropy
             entropy = -torch.sum(val_probs * torch.log(val_probs + 1e-10), dim=-1)
             normalized_entropy = entropy / math.log(6)
             
-            # Use median entropy of ambiguous samples as threshold
+            # Separate entropy by sample type
             ambig_mask = val_labels == -1
-            if ambig_mask.sum() >= 5:  # Need enough samples
-                self._entropy_threshold = normalized_entropy[ambig_mask].median().item()
-                print(f"Entropy threshold (median of ambiguous): {self._entropy_threshold:.3f}")
-            else:
-                self._entropy_threshold = 0.5  # Fallback
-                print(f"Entropy threshold (default): {self._entropy_threshold:.3f}")
+            non_ambig_mask = ~ambig_mask
             
-            # Report validation cost
+            ambig_entropy = normalized_entropy[ambig_mask]
+            non_ambig_entropy = normalized_entropy[non_ambig_mask]
+            
+            # Print statistics
+            print("\n" + "="*60)
+            print("ENTROPY DISTRIBUTION ANALYSIS")
+            print("="*60)
+            print(f"\nAmbiguous samples (n={ambig_mask.sum()}):")
+            print(f"  Min:    {ambig_entropy.min():.4f}")
+            print(f"  25th:   {torch.quantile(ambig_entropy, 0.25):.4f}")
+            print(f"  Median: {torch.median(ambig_entropy):.4f}")
+            print(f"  75th:   {torch.quantile(ambig_entropy, 0.75):.4f}")
+            print(f"  Max:    {ambig_entropy.max():.4f}")
+            
+            print(f"\nNon-ambiguous samples (n={non_ambig_mask.sum()}):")
+            print(f"  Min:    {non_ambig_entropy.min():.4f}")
+            print(f"  25th:   {torch.quantile(non_ambig_entropy, 0.25):.4f}")
+            print(f"  Median: {torch.median(non_ambig_entropy):.4f}")
+            print(f"  75th:   {torch.quantile(non_ambig_entropy, 0.75):.4f}")
+            print(f"  Max:    {non_ambig_entropy.max():.4f}")
+            
+            # Visualize distributions
+            import matplotlib.pyplot as plt
+            fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+            
+            # Histogram
+            axes[0].hist(non_ambig_entropy.numpy(), bins=30, alpha=0.6, label='Non-ambiguous', color='blue')
+            axes[0].hist(ambig_entropy.numpy(), bins=30, alpha=0.6, label='Ambiguous', color='red')
+            axes[0].axvline(torch.median(ambig_entropy).item(), color='red', linestyle='--', label='Ambig median')
+            axes[0].axvline(torch.median(non_ambig_entropy).item(), color='blue', linestyle='--', label='Non-ambig median')
+            axes[0].set_xlabel('Normalized Entropy')
+            axes[0].set_ylabel('Count')
+            axes[0].set_title('Entropy Distribution')
+            axes[0].legend()
+            axes[0].grid(alpha=0.3)
+            
+            # Box plot
+            axes[1].boxplot([non_ambig_entropy.numpy(), ambig_entropy.numpy()], 
+                            labels=['Non-ambiguous', 'Ambiguous'])
+            axes[1].set_ylabel('Normalized Entropy')
+            axes[1].set_title('Entropy Box Plot')
+            axes[1].grid(alpha=0.3)
+            
+            plt.tight_layout()
+            plt.savefig("entropy_distribution.pdf")
+            print("\nSaved entropy distribution plot to entropy_distribution.pdf")
+            plt.close()
+            
+            # Strategy: Choose threshold between distributions
+            # Option 1: 75th percentile of non-ambiguous (catches outliers in non-ambig)
+            threshold_option1 = torch.quantile(non_ambig_entropy, 0.75).item()
+            
+            # Option 2: 25th percentile of ambiguous (catches lower end of ambig distribution)
+            threshold_option2 = torch.quantile(ambig_entropy, 0.25).item()
+            
+            # Option 3: Midpoint between medians
+            threshold_option3 = (torch.median(non_ambig_entropy) + torch.median(ambig_entropy)).item() / 2
+            
+            # Option 4: Point that maximizes separation (geometric mean of medians)
+            threshold_option4 = math.sqrt(torch.median(non_ambig_entropy).item() * torch.median(ambig_entropy).item())
+            
+            print(f"\nThreshold options:")
+            print(f"  1. 75th percentile of non-ambig: {threshold_option1:.4f}")
+            print(f"  2. 25th percentile of ambig:     {threshold_option2:.4f}")
+            print(f"  3. Midpoint of medians:          {threshold_option3:.4f}")
+            print(f"  4. Geometric mean of medians:    {threshold_option4:.4f}")
+            
+            # Evaluate each option
             _, pred_labels = torch.max(val_probs, dim=-1)
-            preds = torch.where(normalized_entropy > self._entropy_threshold, -torch.ones_like(pred_labels), pred_labels)
-            cost = compute_cost(preds, val_labels).item()
-            print(f"Validation cost: {cost:.4f}")
+            print(f"\nValidation costs for each threshold:")
+            best_cost = float('inf')
+            best_threshold = threshold_option3
+            
+            for i, threshold in enumerate([threshold_option1, threshold_option2, threshold_option3, threshold_option4], 1):
+                preds = torch.where(normalized_entropy > threshold, -torch.ones_like(pred_labels), pred_labels)
+                cost = compute_cost(preds, val_labels).item()
+                num_abstain = (preds == -1).sum().item()
+                print(f"  Option {i} ({threshold:.4f}): cost={cost:.4f}, abstentions={num_abstain}")
+                
+                if cost < best_cost:
+                    best_cost = cost
+                    best_threshold = threshold
+            
+            self._entropy_threshold = best_threshold
+            print(f"\nSelected threshold: {best_threshold:.4f}")
+            print(f"Expected validation cost: {best_cost:.4f}")
+            print("="*60)
 
         assert val_images.size() == (140, 3, 60, 60)  # N x C x H x W
         assert val_labels.size() == (140,)
